@@ -355,6 +355,8 @@ pub enum DataKey {
     UserRole(Address),
     /// Per-asset fee override keyed by token address (Fee Router v2).
     PerAssetFee(Address),
+    /// Registry of all token addresses with a per-asset fee override (Fee Router v2, singleton).
+    PerAssetFeeRegistry,
     /// Current active fee collector rotation index (Fee Router v2, singleton).
     FeeCollectorIndex,
     /// Fee collector address at a given rotation index (Fee Router v2).
@@ -667,9 +669,15 @@ pub fn assert_post_upgrade_invariants(env: &Env) -> Result<(), &'static str> {
         qcfg.validate()?;
     }
 
-    // Invariant 6: OracleAggregationConfig bounds (if the singleton has been stored).
-    if let Some(oac) = get_oracle_aggregation_config(env) {
-        oac.validate()?;
+    // Invariant 6: OracleAggregationConfig bounds (always has a value due to defaults).
+    {
+        let oac = get_oracle_aggregation_config(env);
+        if oac.min_sources == 0 {
+            return Err("OracleAggregationConfig: min_sources must be >= 1");
+        }
+        if oac.max_deviation_bps > 10_000 {
+            return Err("OracleAggregationConfig: max_deviation_bps must be <= 10_000 (100%)");
+        }
     }
 
     // Invariant 7: Active OracleFeeConfig bounds (if the oracle pricing is configured).
@@ -1334,37 +1342,24 @@ pub fn get_per_asset_fee_registry(env: &Env) -> Vec<Address> {
 pub fn get_dispute_quorum_config(env: &Env) -> Option<DisputeQuorumConfig> {
     env.storage()
         .persistent()
-        .get(&DataKey::DisputeQuorumCfg)
+        .get(&DataKey::DisputeQuorumConfig)
 }
 
 /// Set the global dispute quorum configuration.
 ///
 /// **Validation**: callers should call `config.validate()` before storing.
+#[allow(dead_code)]
 pub fn set_dispute_quorum_config(env: &Env, config: &DisputeQuorumConfig) {
     env.storage()
         .persistent()
-        .set(&DataKey::DisputeQuorumCfg, config);
+        .set(&DataKey::DisputeQuorumConfig, config);
 }
 
 // -----------------------------------------------------------------------------
 // OracleAggregationConfig helpers (Issue #1173)
+// (get_oracle_aggregation_config / set_oracle_aggregation_config are defined
+// earlier in this file as the canonical multi-source oracle helpers)
 // -----------------------------------------------------------------------------
-
-/// Get the oracle aggregation configuration (if set).
-pub fn get_oracle_aggregation_config(env: &Env) -> Option<OracleAggregationConfig> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::OracleAggregationCfg)
-}
-
-/// Set the oracle aggregation configuration.
-///
-/// **Validation**: callers should call `config.validate()` before storing.
-pub fn set_oracle_aggregation_config(env: &Env, config: &OracleAggregationConfig) {
-    env.storage()
-        .persistent()
-        .set(&DataKey::OracleAggregationCfg, config);
-}
 
 /// Get current fee collector rotation index (default 0).
 pub fn get_fee_collector_index(env: &Env) -> u32 {
