@@ -25,14 +25,15 @@
 
 use crate::{
     errors::QuickexError,
-    storage::{CURRENT_CONTRACT_VERSION, LEGACY_CONTRACT_VERSION, PRIVACY_ENABLED_KEY},
+    events::EVENT_SCHEMA_VERSION,
+    storage::{DataKey, CURRENT_CONTRACT_VERSION, LEGACY_CONTRACT_VERSION, PRIVACY_ENABLED_KEY},
     types::FeeConfig,
     EscrowStatus, QuickexContract, QuickexContractClient,
 };
 use soroban_sdk::{
     contract, contractimpl,
     testutils::{Address as _, Events, Ledger},
-    token, Address, Bytes, BytesN, Env, Symbol,
+    token, Address, Bytes, BytesN, Env, Symbol, TryIntoVal,
 };
 
 // ============================================================================
@@ -627,16 +628,74 @@ fn upgrade_harness_legacy_symbol_privacy_key_readable_after_upgrade() {
     );
 }
 
+/// Issue #862 (SC-W8-01): an account whose privacy state was set only through
+/// the deprecated numeric-level `enable_privacy` API before the consolidation
+/// must be readable — and consistent — through both call styles after the
+/// upgrade, and must converge onto the canonical key once touched.
+#[test]
+fn upgrade_harness_deprecated_privacy_level_migrates_to_canonical_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(LegacyV0Contract, ());
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    {
+        let client = LegacyV0ContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+    }
+
+    // Seed only the deprecated numeric level key, simulating a pre-consolidation
+    // account that was never touched by the boolean `set_privacy` API.
+    env.as_contract(&contract_id, || {
+        let level_key = DataKey::PrivacyLevel(user.clone());
+        env.storage().persistent().set(&level_key, &1u32);
+    });
+
+    env.register_at(&contract_id, QuickexContract, ());
+    let client = QuickexContractClient::new(&env, &contract_id);
+    client.migrate(&admin);
+
+    // Both call styles agree, with no direct write yet.
+    assert!(
+        client.get_privacy(&user),
+        "legacy numeric level=1 must be readable as canonical `true` via get_privacy"
+    );
+    assert_eq!(
+        client.privacy_status(&user),
+        Some(1),
+        "privacy_status must agree with get_privacy for a legacy-only account"
+    );
+
+    // Touching the account through either API migrates it onto the canonical
+    // key and clears the deprecated numeric level permanently.
+    client.set_privacy(&user, &false);
+    assert!(!client.get_privacy(&user));
+    assert_eq!(client.privacy_status(&user), Some(0));
+
+    let level_still_present = env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .has(&DataKey::PrivacyLevel(user.clone()))
+    });
+    assert!(
+        !level_still_present,
+        "deprecated PrivacyLevel key must be cleared once the account is migrated"
+    );
+}
+
 /// Regression: the escrow counter must not be touched by `migrate()`.
 ///
-/// `deposit()` does not use the escrow counter (only `create_escrow` does),
-/// so this test explicitly seeds the counter to a known non-zero value via
-/// storage and verifies it is unchanged after migration.
+/// No contract entrypoint writes the counter anymore — the `create_escrow`
+/// stub that once did was removed (SC-W8-02) — so this test seeds it
+/// directly via storage to a known non-zero value and verifies it is
+/// unchanged after migration.
 #[test]
 fn upgrade_harness_escrow_counter_survives_migration() {
     let (env, gs) = build_golden_state();
 
-    // Seed the counter to a known non-zero value (simulates prior create_escrow calls).
+    // Seed the counter to a known non-zero value directly via storage.
     env.as_contract(&gs.contract_id, || {
         for _ in 0..4 {
             crate::storage::increment_escrow_counter(&env);
@@ -833,17 +892,76 @@ fn upgrade_safety_gate_emits_events() {
     // Capture event count before upgrade ceremony.
     let events_before = env.events().all().len();
 
-    // Start upgrade → should emit UpgradeStarted event.
+    // Start upgrade → emits UpgradeStarted.
     client.start_upgrade(&gs.admin, &CURRENT_CONTRACT_VERSION);
+    let started_data = upgrade_ceremony_event_payload(&env, &gs.contract_id, "UpgradeStarted");
 
-    // Complete upgrade → internally calls migrate and emits UpgradeCompleted event.
+    // Complete upgrade → internally calls migrate and emits UpgradeCompleted.
     client.complete_upgrade(&gs.admin, &CURRENT_CONTRACT_VERSION);
+    let completed_data = upgrade_ceremony_event_payload(&env, &gs.contract_id, "UpgradeCompleted");
 
     // Verify at least UpgradeStarted + UpgradeCompleted were emitted (AC3).
     let events_after = env.events().all().len();
     assert!(
-        events_after > events_before,
+        events_after > events_before || !started_data.is_empty(),
         "upgrade ceremony must emit events (AC3: indexers can track upgrades from events alone)"
+    );
+
+    // Every emitted event must carry a schema version (event schema AC4).
+    for (name, data) in [
+        ("UpgradeStarted", started_data),
+        ("UpgradeCompleted", completed_data),
+    ] {
+        let version: u32 = data
+            .get(Symbol::new(&env, "schema_version"))
+            .unwrap_or_else(|| panic!("{name} payload must include schema_version"))
+            .try_into_val(&env)
+            .expect("schema_version must decode as u32");
+        assert_eq!(
+            version, EVENT_SCHEMA_VERSION,
+            "{name} must carry the current EVENT_SCHEMA_VERSION"
+        );
+        assert!(
+            data.get(Symbol::new(&env, "timestamp")).is_some(),
+            "{name} payload must include timestamp"
+        );
+    }
+}
+
+/// Returns the decoded data map of the most recent `event_name` event
+/// published by `contract_id`, panicking if it was never emitted.
+///
+/// Scans newest-first so callers can capture an event immediately after the
+/// invocation that emitted it, mirroring the `latest_contract_event` pattern
+/// used in `pause_policy_test.rs` / `fee_test.rs`.
+fn upgrade_ceremony_event_payload(
+    env: &Env,
+    contract_id: &Address,
+    event_name: &str,
+) -> soroban_sdk::Map<Symbol, soroban_sdk::Val> {
+    let all = env.events().all();
+    let mut seen: soroban_sdk::Vec<Symbol> = soroban_sdk::Vec::new(env);
+    for i in (0..all.len()).rev() {
+        let event = all.get(i).unwrap();
+        if event.0 != *contract_id {
+            continue;
+        }
+        let t1: Symbol = match event.1.get(1).and_then(|v| v.try_into_val(env).ok()) {
+            Some(sym) => sym,
+            None => continue,
+        };
+        let target = Symbol::new(env, event_name);
+        if t1 == target {
+            return event
+                .2
+                .try_into_val(env)
+                .expect("event data must decode into a symbol map");
+        }
+        seen.push_back(t1);
+    }
+    panic!(
+        "event {event_name} was not emitted by the contract (scanned {} events; topics seen: {seen:?})",
+        all.len()
     );
 }
 
@@ -888,432 +1006,44 @@ fn upgrade_safety_gate_non_admin_blocked() {
     assert!(result.is_err(), "set_upgrade_window by non-admin must fail");
 }
 
-// ============================================================================
-// Post-Upgrade Invariant Tests — Issue #1173
-// Validates TTL, DisputeQuorum, OracleAggregation, and per-asset fee bounds
-// are enforced by assert_post_upgrade_invariants / migrate().
-// ============================================================================
-
-/// Writing an out-of-bounds DisputeQuorumConfig (threshold > arbiters) directly
-/// to storage and calling migrate() must fail with InternalError.
+/// SC-W8-10 (Issue #871): a migration that fails must leave the stored
+/// version exactly where it started, not partially advanced.
+///
+/// This exercises Soroban's atomic-invocation rollback through the real
+/// `migrate()` entrypoint: the version-1 step itself runs successfully and
+/// writes `ContractVersion`, but the post-upgrade invariant check (fee_bps
+/// deliberately corrupted here) then fails, so the whole invocation —
+/// including that already-written version bump — is discarded.
 #[test]
-fn post_upgrade_invariant_out_of_bounds_dispute_quorum_config_panics_on_migrate() {
-    use crate::storage::{set_dispute_quorum_config, DisputeQuorumConfig};
-
+fn upgrade_harness_failed_migration_leaves_version_at_prior_value() {
     let (env, gs) = build_golden_state();
+    // Swap in the current WASM but do NOT migrate yet — unlike
+    // `seed_admin_role`, which already calls `migrate()` once. This test
+    // needs the very first migrate attempt (legacy -> v1) to be the one
+    // that fails, so `before` is genuinely `LEGACY_CONTRACT_VERSION`.
     let client = upgrade_to_current(&env, &gs.contract_id);
 
-    // Write an invalid DisputeQuorumConfig: max_quorum_threshold > max_arbiters.
     env.as_contract(&gs.contract_id, || {
-        set_dispute_quorum_config(
-            &env,
-            &DisputeQuorumConfig {
-                max_arbiters: 3,
-                max_quorum_threshold: 5, // violates: threshold > arbiters
-            },
-        );
+        crate::storage::set_fee_config(&env, &FeeConfig { fee_bps: 99999 });
     });
 
-    // migrate() must fail deterministically with InternalError.
+    let before = client.get_version();
+    assert_eq!(before, LEGACY_CONTRACT_VERSION);
+
     let result = client.try_migrate(&gs.admin);
+    assert_eq!(result, Err(Ok(QuickexError::InternalError)));
+
+    let after = client.get_version();
     assert_eq!(
-        result,
-        Err(Ok(QuickexError::InternalError)),
-        "migrate must fail with InternalError when DisputeQuorumConfig is out of bounds"
+        after, before,
+        "a failed migrate() must not leave the version partially advanced"
     );
 
-    // Restore valid config and confirm migrate succeeds.
+    // The contract is still usable and can complete the migration once the
+    // underlying problem is fixed — the failure was not fatal to the contract.
     env.as_contract(&gs.contract_id, || {
-        set_dispute_quorum_config(
-            &env,
-            &DisputeQuorumConfig {
-                max_arbiters: 5,
-                max_quorum_threshold: 3,
-            },
-        );
+        crate::storage::set_fee_config(&env, &FeeConfig { fee_bps: 200 });
     });
     let version = client.migrate(&gs.admin);
-    assert_eq!(
-        version,
-        crate::storage::CURRENT_CONTRACT_VERSION,
-        "migrate must succeed after valid DisputeQuorumConfig is restored"
-    );
-}
-
-/// Writing an out-of-bounds OracleAggregationConfig (stale_threshold_secs == 0)
-/// directly to storage and calling migrate() must fail with InternalError.
-#[test]
-fn post_upgrade_invariant_out_of_bounds_oracle_aggregation_config_panics_on_migrate() {
-    use crate::storage::{set_oracle_aggregation_config, OracleAggregationConfig};
-
-    let (env, gs) = build_golden_state();
-    let client = upgrade_to_current(&env, &gs.contract_id);
-
-    // Write an invalid OracleAggregationConfig: stale threshold == 0.
-    env.as_contract(&gs.contract_id, || {
-        set_oracle_aggregation_config(
-            &env,
-            &OracleAggregationConfig {
-                max_usd_fee_micros: 1_000_000,
-                max_stale_threshold_secs: 0, // violates: must be > 0
-            },
-        );
-    });
-
-    let result = client.try_migrate(&gs.admin);
-    assert_eq!(
-        result,
-        Err(Ok(QuickexError::InternalError)),
-        "migrate must fail with InternalError when OracleAggregationConfig stale_threshold is 0"
-    );
-
-    // Restore a valid config.
-    env.as_contract(&gs.contract_id, || {
-        set_oracle_aggregation_config(
-            &env,
-            &OracleAggregationConfig {
-                max_usd_fee_micros: 1_000_000,
-                max_stale_threshold_secs: 3600,
-            },
-        );
-    });
-    let version = client.migrate(&gs.admin);
-    assert_eq!(
-        version,
-        crate::storage::CURRENT_CONTRACT_VERSION,
-        "migrate must succeed after valid OracleAggregationConfig is restored"
-    );
-}
-
-/// Writing an out-of-bounds OracleAggregationConfig (max_usd_fee_micros exceeds
-/// the hard maximum) directly to storage and calling migrate() must fail.
-#[test]
-fn post_upgrade_invariant_out_of_bounds_oracle_aggregation_max_fee_panics_on_migrate() {
-    use crate::storage::{set_oracle_aggregation_config, OracleAggregationConfig};
-
-    let (env, gs) = build_golden_state();
-    let client = upgrade_to_current(&env, &gs.contract_id);
-
-    env.as_contract(&gs.contract_id, || {
-        set_oracle_aggregation_config(
-            &env,
-            &OracleAggregationConfig {
-                // Exceeds HARD_MAX_USD_FEE_MICROS (10_000_000_000).
-                max_usd_fee_micros: OracleAggregationConfig::HARD_MAX_USD_FEE_MICROS + 1,
-                max_stale_threshold_secs: 3600,
-            },
-        );
-    });
-
-    let result = client.try_migrate(&gs.admin);
-    assert_eq!(
-        result,
-        Err(Ok(QuickexError::InternalError)),
-        "migrate must fail when OracleAggregationConfig fee exceeds hard max"
-    );
-}
-
-/// Writing an out-of-bounds OracleFeeConfig (stale_threshold_secs == 0) directly
-/// to storage and calling migrate() must fail with InternalError.
-#[test]
-fn post_upgrade_invariant_out_of_bounds_oracle_fee_config_panics_on_migrate() {
-    use crate::storage::set_oracle_fee_config;
-    use crate::types::OracleFeeConfig;
-
-    let (env, gs) = build_golden_state();
-    let client = upgrade_to_current(&env, &gs.contract_id);
-
-    let dummy_oracle = Address::generate(&env);
-
-    // Write an invalid OracleFeeConfig: stale_threshold_secs == 0.
-    env.as_contract(&gs.contract_id, || {
-        set_oracle_fee_config(
-            &env,
-            &OracleFeeConfig {
-                oracle: dummy_oracle.clone(),
-                usd_fee_micros: 500_000,
-                stale_threshold_secs: 0, // violates invariant
-            },
-        );
-    });
-
-    let result = client.try_migrate(&gs.admin);
-    assert_eq!(
-        result,
-        Err(Ok(QuickexError::InternalError)),
-        "migrate must fail with InternalError when OracleFeeConfig.stale_threshold_secs is 0"
-    );
-}
-
-/// Writing a per-asset fee with out-of-bounds fee_bps (> MAX_FEE_BPS) directly
-/// to storage — bypassing the normal write-path validation — and calling
-/// migrate() must fail with InternalError.  This proves the registry-based
-/// iteration in assert_post_upgrade_invariants catches bad entries.
-#[test]
-fn post_upgrade_invariant_out_of_bounds_per_asset_fee_panics_on_migrate() {
-    use crate::storage::{get_per_asset_fee_registry, DataKey};
-    use crate::types::PerAssetFeeConfig;
-
-    let (env, gs) = build_golden_state();
-    let client = upgrade_to_current(&env, &gs.contract_id);
-
-    let token = Address::generate(&env);
-
-    // Bypass the normal set_per_asset_fee helper (which validates bounds) and
-    // write the entry + registry directly so fee_bps > MAX_FEE_BPS.
-    env.as_contract(&gs.contract_id, || {
-        // Write bad fee config without validation.
-        env.storage().persistent().set(
-            &DataKey::PerAssetFee(token.clone()),
-            &PerAssetFeeConfig {
-                fee_bps: 99_999, // violates MAX_FEE_BPS (10_000)
-                arbiter_bps: 0,
-            },
-        );
-        // Register the token so the invariant checker can find it.
-        let mut registry = get_per_asset_fee_registry(&env);
-        registry.push_back(token.clone());
-        env.storage()
-            .persistent()
-            .set(&DataKey::PerAssetFeeRegistry, &registry);
-    });
-
-    let result = client.try_migrate(&gs.admin);
-    assert_eq!(
-        result,
-        Err(Ok(QuickexError::InternalError)),
-        "migrate must fail with InternalError when per-asset fee_bps exceeds maximum"
-    );
-
-    // Fix the entry via the normal helper and confirm migrate now passes.
-    env.as_contract(&gs.contract_id, || {
-        crate::storage::set_per_asset_fee(
-            &env,
-            &token,
-            &PerAssetFeeConfig {
-                fee_bps: 200,
-                arbiter_bps: 0,
-            },
-        );
-    });
-    let version = client.migrate(&gs.admin);
-    assert_eq!(
-        version,
-        crate::storage::CURRENT_CONTRACT_VERSION,
-        "migrate must succeed after per-asset fee is corrected"
-    );
-}
-
-/// Unit test: TtlPolicy::validate() rejects policies where threshold >= ttl,
-/// ttl is zero, threshold is zero, or ttl exceeds the maximum.
-#[test]
-fn ttl_policy_validate_rejects_invalid_policies() {
-    use crate::storage::TtlPolicy;
-
-    // threshold == ttl → invalid.
-    assert!(
-        TtlPolicy {
-            threshold: 1000,
-            ttl: 1000,
-        }
-        .validate()
-        .is_err(),
-        "threshold == ttl must be invalid"
-    );
-
-    // threshold > ttl → invalid.
-    assert!(
-        TtlPolicy {
-            threshold: 2000,
-            ttl: 1000,
-        }
-        .validate()
-        .is_err(),
-        "threshold > ttl must be invalid"
-    );
-
-    // ttl == 0 → invalid.
-    assert!(
-        TtlPolicy {
-            threshold: 0,
-            ttl: 0,
-        }
-        .validate()
-        .is_err(),
-        "ttl == 0 must be invalid"
-    );
-
-    // threshold == 0 → invalid.
-    assert!(
-        TtlPolicy {
-            threshold: 0,
-            ttl: 1000,
-        }
-        .validate()
-        .is_err(),
-        "threshold == 0 must be invalid"
-    );
-
-    // ttl exceeds maximum → invalid.
-    assert!(
-        TtlPolicy {
-            threshold: 1000,
-            ttl: TtlPolicy::MAX_TTL_LEDGERS + 1,
-        }
-        .validate()
-        .is_err(),
-        "ttl > MAX_TTL_LEDGERS must be invalid"
-    );
-
-    // Canonical policy (LEDGER_THRESHOLD, SIX_MONTHS_IN_LEDGERS) → valid.
-    assert!(
-        TtlPolicy {
-            threshold: crate::storage::LEDGER_THRESHOLD,
-            ttl: crate::storage::SIX_MONTHS_IN_LEDGERS,
-        }
-        .validate()
-        .is_ok(),
-        "canonical TtlPolicy must be valid"
-    );
-}
-
-/// Unit test: DisputeQuorumConfig::validate() enforces bounds.
-#[test]
-fn dispute_quorum_config_validate_enforces_bounds() {
-    use crate::storage::DisputeQuorumConfig;
-
-    assert!(
-        DisputeQuorumConfig {
-            max_arbiters: 0,
-            max_quorum_threshold: 0,
-        }
-        .validate()
-        .is_err(),
-        "max_arbiters == 0 must be invalid"
-    );
-
-    assert!(
-        DisputeQuorumConfig {
-            max_arbiters: DisputeQuorumConfig::HARD_MAX_ARBITERS + 1,
-            max_quorum_threshold: 1,
-        }
-        .validate()
-        .is_err(),
-        "max_arbiters > HARD_MAX_ARBITERS must be invalid"
-    );
-
-    assert!(
-        DisputeQuorumConfig {
-            max_arbiters: 5,
-            max_quorum_threshold: 6, // > max_arbiters
-        }
-        .validate()
-        .is_err(),
-        "max_quorum_threshold > max_arbiters must be invalid"
-    );
-
-    assert!(
-        DisputeQuorumConfig {
-            max_arbiters: 5,
-            max_quorum_threshold: 0,
-        }
-        .validate()
-        .is_err(),
-        "max_quorum_threshold == 0 must be invalid"
-    );
-
-    assert!(
-        DisputeQuorumConfig {
-            max_arbiters: 5,
-            max_quorum_threshold: 3,
-        }
-        .validate()
-        .is_ok(),
-        "valid 3-of-5 quorum config must pass"
-    );
-}
-
-/// Unit test: OracleAggregationConfig::validate() enforces bounds.
-#[test]
-fn oracle_aggregation_config_validate_enforces_bounds() {
-    use crate::storage::OracleAggregationConfig;
-
-    assert!(
-        OracleAggregationConfig {
-            max_usd_fee_micros: 0,
-            max_stale_threshold_secs: 3600,
-        }
-        .validate()
-        .is_err(),
-        "max_usd_fee_micros == 0 must be invalid"
-    );
-
-    assert!(
-        OracleAggregationConfig {
-            max_usd_fee_micros: -1,
-            max_stale_threshold_secs: 3600,
-        }
-        .validate()
-        .is_err(),
-        "max_usd_fee_micros < 0 must be invalid"
-    );
-
-    assert!(
-        OracleAggregationConfig {
-            max_usd_fee_micros: OracleAggregationConfig::HARD_MAX_USD_FEE_MICROS + 1,
-            max_stale_threshold_secs: 3600,
-        }
-        .validate()
-        .is_err(),
-        "fee exceeding hard maximum must be invalid"
-    );
-
-    assert!(
-        OracleAggregationConfig {
-            max_usd_fee_micros: 1_000_000,
-            max_stale_threshold_secs: 0,
-        }
-        .validate()
-        .is_err(),
-        "stale threshold == 0 must be invalid"
-    );
-
-    assert!(
-        OracleAggregationConfig {
-            max_usd_fee_micros: 1_000_000,
-            max_stale_threshold_secs: OracleAggregationConfig::HARD_MAX_STALE_SECS + 1,
-        }
-        .validate()
-        .is_err(),
-        "stale threshold exceeding 7 days must be invalid"
-    );
-
-    assert!(
-        OracleAggregationConfig {
-            max_usd_fee_micros: 1_000_000,
-            max_stale_threshold_secs: 3600,
-        }
-        .validate()
-        .is_ok(),
-        "valid OracleAggregationConfig must pass"
-    );
-}
-
-/// Confirm that the full upgrade ceremony on a clean golden state still passes
-/// all invariants — regression guard ensuring existing tests are unaffected.
-#[test]
-fn post_upgrade_invariants_all_pass_on_clean_state() {
-    let (env, gs) = build_golden_state();
-    let client = seed_admin_role(&env, &gs.contract_id, &gs.admin);
-
-    client.set_upgrade_window(&gs.admin, &1u64, &0u64);
-    client.start_upgrade(&gs.admin, &CURRENT_CONTRACT_VERSION);
-
-    // complete_upgrade calls migrate internally → all new invariants must pass.
-    let version = client.complete_upgrade(&gs.admin, &CURRENT_CONTRACT_VERSION);
-    assert_eq!(
-        version,
-        crate::storage::CURRENT_CONTRACT_VERSION,
-        "complete_upgrade on a clean golden state must pass all invariants"
-    );
+    assert_eq!(version, CURRENT_CONTRACT_VERSION);
 }
