@@ -1422,6 +1422,7 @@ impl QuickexContract {
     ///
     /// # Errors
     /// * `OracleSourceAlreadyRegistered` - `source` is already registered
+    /// * `OracleSourceLimitExceeded`     - maximum number of sources (`oracle::MAX_ORACLE_SOURCES`) reached
     pub fn register_oracle_source(
         env: Env,
         caller: Address,
